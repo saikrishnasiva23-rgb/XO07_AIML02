@@ -1,7 +1,11 @@
 import math
+import tempfile
+from pathlib import Path
 
 import pytest
 
+from src.api_client import EvaluationRunner, MockEvaluationServer
+from src.database import RetailDatabase
 from src.system import AdaptiveRetailSystem
 
 
@@ -229,3 +233,79 @@ def test_system_handles_short_and_constant_histories_without_crashing(history):
     result = system.process_observation(history[-1] + 2.0)
     assert math.isfinite(result["observation"]["error"])
     assert "system_status" in result["observation"]
+
+
+def test_perishable_product_catalog_and_fiscal_history_support():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = RetailDatabase(db_path=str(Path(tmpdir) / "product_test.db"))
+
+        db.add_product("fresh-bread", "Fresh Bread", category="Perishable Food", current_stock=120.0)
+        db.add_product("fresh-sandwich", "Fresh Sandwich", category="Perishable Food", current_stock=90.0)
+        db.add_product("prepared-salad", "Prepared Salad", category="Perishable Food", current_stock=60.0)
+
+        catalog = db.get_product_catalog(include_perishable_only=True)
+        assert {row["product_name"] for row in catalog} >= {"Fresh Bread", "Fresh Sandwich", "Prepared Salad"}
+
+        history_2023 = [
+            {"timestamp": "2023-01-01T00:00:00", "demand": 100.0, "stock_purchased": 110.0, "units_sold": 100.0},
+            {"timestamp": "2023-02-01T00:00:00", "demand": 120.0, "stock_purchased": 125.0, "units_sold": 120.0},
+            {"timestamp": "2023-03-01T00:00:00", "demand": 130.0, "stock_purchased": 140.0, "units_sold": 130.0},
+        ]
+        history_2024 = [
+            {"timestamp": "2024-01-01T00:00:00", "demand": 150.0, "stock_purchased": 160.0, "units_sold": 150.0},
+            {"timestamp": "2024-02-01T00:00:00", "demand": 170.0, "stock_purchased": 175.0, "units_sold": 170.0},
+        ]
+        for row in history_2023 + history_2024:
+            db.record_demand(
+                product_id="fresh-bread",
+                demand=row["demand"],
+                stock_purchased=row["stock_purchased"],
+                units_sold=row["units_sold"],
+                timestamp=row["timestamp"],
+            )
+
+        product_history = db.get_product_history("fresh-bread")
+        assert len(product_history) >= 5
+        assert product_history[-1]["demand"] == pytest.approx(170.0)
+
+        previous_year = db.get_previous_fiscal_year_summary("fresh-bread")
+        assert previous_year["product_id"] == "fresh-bread"
+        assert previous_year["total_demand"] >= 350.0
+        assert previous_year["total_stock_purchased"] >= 350.0
+        assert previous_year["monthly_demand"]
+
+        context = db.get_product_context("fresh-bread")
+        assert context["product_name"] == "Fresh Bread"
+        assert context["history"]
+        assert "previous_fiscal_year" in context
+
+        db.close()
+
+
+def test_mock_sc1_runner_runs_sequential_prediction_cycle_without_target_leakage():
+    mock_server = MockEvaluationServer(stream_name="SC1")
+    runner = EvaluationRunner(server=mock_server, stream_name="SC1", team_name="demo-team")
+
+    result = runner.run(max_rows=4)
+
+    assert result["stream"] == "SC1"
+    assert result["rows_processed"] == 4
+    assert result["session_id"] == mock_server.session_id
+    assert result["history"]
+    assert all(item["prediction"] is not None for item in result["history"])
+    assert all(item["actual"] is not None for item in result["history"])
+    assert all(item["error"] is not None for item in result["history"])
+    assert all(item["used_target_before_prediction"] is False for item in result["history"])
+
+
+def test_mock_sc2_runner_keeps_session_state_and_tracks_monitoring():
+    mock_server = MockEvaluationServer(stream_name="SC2")
+    runner = EvaluationRunner(server=mock_server, stream_name="SC2", team_name="demo-team")
+
+    result = runner.run(max_rows=3)
+
+    assert result["stream"] == "SC2"
+    assert result["rows_processed"] == 3
+    assert result["session_id"] == mock_server.session_id
+    assert all(item["monitor_status"] in {"STABLE", "WATCH", "POSSIBLE CHANGE", "PERSISTENT CHANGE"} for item in result["history"])
+    assert "session_id" in runner.get_status()

@@ -31,15 +31,67 @@ class RetailDatabase:
         self._connection: Optional[sqlite3.Connection] = None
         self.initialize_database()
 
+    def __enter__(self) -> "RetailDatabase":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     @property
     def connection(self) -> sqlite3.Connection:
         """Return the active SQLite connection, creating it if needed."""
 
         if self._connection is None:
-            self._connection = sqlite3.connect(str(self.db_path))
+            self._connection = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+            )
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
         return self._connection
+
+    def _column_names(self, table_name: str) -> set[str]:
+        """Return the set of column names for a SQLite table."""
+
+        rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row[1]) for row in rows}
+
+    def _ensure_schema_columns(self, conn: sqlite3.Connection) -> None:
+        """Add any newer columns to existing SQLite tables without discarding prior data."""
+
+        product_columns = {
+            "perishable": "INTEGER NOT NULL DEFAULT 0",
+            "perishable_lifetime_days": "REAL DEFAULT 1.0",
+            "fiscal_year_start_month": "INTEGER NOT NULL DEFAULT 1",
+        }
+
+        for column_name, column_definition in product_columns.items():
+            if column_name not in self._column_names("products"):
+                conn.execute(
+                    f"ALTER TABLE products ADD COLUMN {column_name} {column_definition}"
+                )
+
+        demand_columns = {
+            "stock_purchased": "REAL",
+            "units_sold": "REAL",
+            "actual_demand": "REAL",
+            "previous_prediction": "REAL",
+            "prediction_error": "REAL",
+            "event_info": "TEXT",
+            "fiscal_year": "TEXT",
+        }
+
+        for column_name, column_definition in demand_columns.items():
+            if column_name not in self._column_names("demand_history"):
+                conn.execute(
+                    f"ALTER TABLE demand_history ADD COLUMN {column_name} {column_definition}"
+                )
 
     def _normalize_timestamp(self, timestamp: Optional[str] = None) -> str:
         """Return an ISO-8601 timestamp string."""
@@ -76,6 +128,9 @@ class RetailDatabase:
                 unit_price REAL NOT NULL DEFAULT 0.0,
                 reorder_level REAL NOT NULL DEFAULT 0.0,
                 supplier TEXT,
+                perishable INTEGER NOT NULL DEFAULT 0,
+                perishable_lifetime_days REAL DEFAULT 1.0,
+                fiscal_year_start_month INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -88,10 +143,19 @@ class RetailDatabase:
                 product_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 demand REAL NOT NULL,
+                stock_purchased REAL,
+                units_sold REAL,
+                actual_demand REAL,
+                previous_prediction REAL,
+                prediction_error REAL,
+                event_info TEXT,
+                fiscal_year TEXT,
                 FOREIGN KEY(product_id) REFERENCES products(product_id) ON DELETE CASCADE
             )
             """
         )
+
+        self._ensure_schema_columns(conn)
 
         conn.execute(
             """
@@ -162,6 +226,9 @@ class RetailDatabase:
         unit_price: float = 0.0,
         reorder_level: float = 0.0,
         supplier: Optional[str] = None,
+        perishable: bool = False,
+        perishable_lifetime_days: float = 1.0,
+        fiscal_year_start_month: int = 1,
     ) -> Dict[str, Any]:
         """Insert or replace a product record in the database."""
 
@@ -173,8 +240,13 @@ class RetailDatabase:
             current_stock_value = float(current_stock)
             unit_price_value = float(unit_price)
             reorder_level_value = float(reorder_level)
+            perishable_lifetime = float(perishable_lifetime_days)
+            fiscal_start_month = int(fiscal_year_start_month)
         except (TypeError, ValueError) as exc:
             raise ValueError("Stock, unit price, and reorder level must be numeric.") from exc
+
+        if not 1 <= fiscal_start_month <= 12:
+            raise ValueError("fiscal_year_start_month must be between 1 and 12.")
 
         record = {
             "product_id": normalized_id,
@@ -184,6 +256,9 @@ class RetailDatabase:
             "unit_price": unit_price_value,
             "reorder_level": reorder_level_value,
             "supplier": str(supplier).strip() if supplier is not None else None,
+            "perishable": 1 if bool(perishable) else 0,
+            "perishable_lifetime_days": perishable_lifetime,
+            "fiscal_year_start_month": fiscal_start_month,
         }
 
         conn = self.connection
@@ -196,8 +271,11 @@ class RetailDatabase:
                 current_stock,
                 unit_price,
                 reorder_level,
-                supplier
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                supplier,
+                perishable,
+                perishable_lifetime_days,
+                fiscal_year_start_month
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["product_id"],
@@ -207,6 +285,9 @@ class RetailDatabase:
                 record["unit_price"],
                 record["reorder_level"],
                 record["supplier"],
+                record["perishable"],
+                record["perishable_lifetime_days"],
+                record["fiscal_year_start_month"],
             ),
         )
         conn.commit()
@@ -232,6 +313,53 @@ class RetailDatabase:
             "SELECT * FROM products ORDER BY product_id ASC"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_product_catalog(
+        self,
+        include_perishable_only: bool = False,
+        category: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return available products, optionally restricted to perishable food items."""
+
+        query = "SELECT * FROM products"
+        clauses: List[str] = []
+        params: List[Any] = []
+
+        if include_perishable_only:
+            clauses.append(
+                "("
+                "LOWER(COALESCE(category, '')) LIKE '%food%' OR "
+                "LOWER(COALESCE(category, '')) LIKE '%bakery%' OR "
+                "LOWER(COALESCE(category, '')) LIKE '%fresh%' OR "
+                "LOWER(COALESCE(product_name, '')) LIKE '%bread%' OR "
+                "LOWER(COALESCE(product_name, '')) LIKE '%sandwich%' OR "
+                "LOWER(COALESCE(product_name, '')) LIKE '%pastry%' OR "
+                "LOWER(COALESCE(product_name, '')) LIKE '%salad%' OR "
+                "COALESCE(perishable, 0) = 1"
+                ")"
+            )
+
+        if category is not None:
+            clauses.append("LOWER(COALESCE(category, '')) LIKE ?")
+            params.append(f"%{str(category).lower()}%")
+
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+
+        query += " ORDER BY product_name ASC"
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
+        rows = self.connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_available_perishable_products(self) -> List[Dict[str, Any]]:
+        """Compatibility wrapper for catalog queries restricted to perishable food items."""
+
+        return self.get_product_catalog(include_perishable_only=True)
 
     def update_stock(
         self,
@@ -271,8 +399,14 @@ class RetailDatabase:
         product_id: str,
         demand: float,
         timestamp: Optional[str] = None,
+        stock_purchased: Optional[float] = None,
+        units_sold: Optional[float] = None,
+        previous_prediction: Optional[float] = None,
+        prediction_error: Optional[float] = None,
+        event_info: Optional[str] = None,
+        fiscal_year: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Record one demand entry for a product."""
+        """Record one demand entry for a product, including perishable-food context where available."""
 
         normalized_id = self._validate_product_id(product_id)
         if self.get_product(normalized_id) is None:
@@ -286,14 +420,49 @@ class RetailDatabase:
         if demand_value < 0:
             raise ValueError("demand cannot be negative.")
 
+        stock_value = None if stock_purchased is None else float(stock_purchased)
+        units_value = None if units_sold is None else float(units_sold)
+        actual_demand_value = demand_value
+        prev_prediction_value = None if previous_prediction is None else float(previous_prediction)
+        prediction_error_value = None if prediction_error is None else float(prediction_error)
+
+        if units_value is None:
+            units_value = demand_value
+        if stock_value is not None and stock_value < 0:
+            raise ValueError("stock_purchased cannot be negative.")
+        if units_value < 0:
+            raise ValueError("units_sold cannot be negative.")
+
         entry_time = self._normalize_timestamp(timestamp)
+        fiscal_value = fiscal_year or self._infer_fiscal_year(entry_time)
 
         cursor = self.connection.execute(
             """
-            INSERT INTO demand_history (product_id, timestamp, demand)
-            VALUES (?, ?, ?)
+            INSERT INTO demand_history (
+                product_id,
+                timestamp,
+                demand,
+                stock_purchased,
+                units_sold,
+                actual_demand,
+                previous_prediction,
+                prediction_error,
+                event_info,
+                fiscal_year
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (normalized_id, entry_time, demand_value),
+            (
+                normalized_id,
+                entry_time,
+                demand_value,
+                stock_value,
+                units_value,
+                actual_demand_value,
+                prev_prediction_value,
+                prediction_error_value,
+                event_info,
+                fiscal_value,
+            ),
         )
         self.connection.commit()
 
@@ -302,7 +471,32 @@ class RetailDatabase:
             "product_id": normalized_id,
             "timestamp": entry_time,
             "demand": demand_value,
+            "stock_purchased": stock_value,
+            "units_sold": units_value,
+            "actual_demand": actual_demand_value,
+            "previous_prediction": prev_prediction_value,
+            "prediction_error": prediction_error_value,
+            "event_info": event_info,
+            "fiscal_year": fiscal_value,
         }
+
+    def _infer_fiscal_year(self, timestamp: Optional[str] = None) -> str:
+        """Infer the fiscal year label for a timestamp using a default yearly cycle."""
+
+        if timestamp is None:
+            timestamp = self._normalize_timestamp(None)
+
+        try:
+            value = datetime.fromisoformat(str(timestamp))
+        except ValueError:
+            value = datetime.now()
+
+        fiscal_year_start = 1
+        month = value.month
+        year = value.year
+        if month >= fiscal_year_start:
+            return f"FY-{year}"
+        return f"FY-{year - 1}"
 
     def get_demand_history(
         self,
@@ -326,6 +520,164 @@ class RetailDatabase:
 
         rows = self.connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_product_history(
+        self,
+        product_id: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return a product's historical record ordered chronologically for forecasting context."""
+
+        normalized_id = self._validate_product_id(product_id)
+        if self.get_product(normalized_id) is None:
+            return []
+
+        query = "SELECT * FROM demand_history WHERE product_id = ? ORDER BY timestamp ASC"
+        params: List[Any] = [normalized_id]
+
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
+        rows = self.connection.execute(query, params).fetchall()
+        history: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["demand"] = float(item.get("demand", item.get("actual_demand", 0.0)))
+            item["actual_demand"] = float(item.get("actual_demand", item.get("demand", 0.0)))
+            if item.get("stock_purchased") is not None:
+                item["stock_purchased"] = float(item["stock_purchased"])
+            if item.get("units_sold") is not None:
+                item["units_sold"] = float(item["units_sold"])
+            history.append(item)
+        return history
+
+    def get_previous_fiscal_year_summary(
+        self,
+        product_id: str,
+    ) -> Dict[str, Any]:
+        """Aggregate one product's previous fiscal-year demand and stock data for historical context."""
+
+        normalized_id = self._validate_product_id(product_id)
+        product = self.get_product(normalized_id)
+        if product is None:
+            raise ValueError(f"Product '{normalized_id}' does not exist.")
+
+        history = self.get_product_history(normalized_id)
+        if not history:
+            return {
+                "product_id": normalized_id,
+                "product_name": product.get("product_name"),
+                "fiscal_year": None,
+                "total_demand": 0.0,
+                "total_stock_purchased": 0.0,
+                "total_units_sold": 0.0,
+                "avg_daily_demand": 0.0,
+                "monthly_demand": {},
+                "high_demand_period": None,
+                "low_demand_period": None,
+                "days_observed": 0,
+                "historical_patterns": {},
+            }
+
+        fiscal_year_start = int(product.get("fiscal_year_start_month", 1) or 1)
+        observed_years: set[int] = set()
+        records_by_year: Dict[int, List[Dict[str, Any]]] = {}
+
+        for item in history:
+            ts = str(item.get("timestamp", ""))
+            try:
+                value = datetime.fromisoformat(ts)
+            except ValueError:
+                value = datetime.now()
+            observed_years.add(value.year)
+            fiscal_year = value.year if value.month >= fiscal_year_start else value.year - 1
+            records_by_year.setdefault(fiscal_year, []).append(item)
+
+        current_fiscal_year = max(observed_years) if observed_years else datetime.now().year
+        previous_fiscal_year = current_fiscal_year - 1
+        previous_rows = records_by_year.get(previous_fiscal_year, [])
+
+        if not previous_rows and observed_years:
+            previous_fiscal_year = min(observed_years) if len(observed_years) == 1 else max(observed_years) - 1
+            previous_rows = records_by_year.get(previous_fiscal_year, [])
+
+        totals = {
+            "total_demand": 0.0,
+            "total_stock_purchased": 0.0,
+            "total_units_sold": 0.0,
+            "days_observed": len(previous_rows),
+        }
+        monthly_demand: Dict[str, float] = {}
+        peak_period = None
+        low_period = None
+
+        for item in previous_rows:
+            demand = float(item.get("demand", item.get("actual_demand", 0.0)) or 0.0)
+            stock = float(item.get("stock_purchased") or 0.0)
+            sold = float(item.get("units_sold") or demand)
+            totals["total_demand"] += demand
+            totals["total_stock_purchased"] += stock
+            totals["total_units_sold"] += sold
+
+            ts = str(item.get("timestamp", ""))
+            try:
+                dt = datetime.fromisoformat(ts)
+                month_key = dt.strftime("%Y-%m")
+            except ValueError:
+                month_key = previous_fiscal_year
+
+            monthly_demand[month_key] = monthly_demand.get(month_key, 0.0) + demand
+
+        if monthly_demand:
+            peak_period = max(monthly_demand.items(), key=lambda pair: pair[1])
+            low_period = min(monthly_demand.items(), key=lambda pair: pair[1])
+
+        summary = {
+            "product_id": normalized_id,
+            "product_name": product.get("product_name"),
+            "fiscal_year": previous_fiscal_year,
+            "total_demand": float(totals["total_demand"]),
+            "total_stock_purchased": float(totals["total_stock_purchased"]),
+            "total_units_sold": float(totals["total_units_sold"]),
+            "avg_daily_demand": float(totals["total_demand"] / max(1, totals["days_observed"])),
+            "monthly_demand": dict(sorted(monthly_demand.items())),
+            "high_demand_period": {"period": peak_period[0], "demand": float(peak_period[1])} if peak_period else None,
+            "low_demand_period": {"period": low_period[0], "demand": float(low_period[1])} if low_period else None,
+            "days_observed": totals["days_observed"],
+            "historical_patterns": {
+                "mean_demand": float(totals["total_demand"] / max(1, totals["days_observed"])),
+                "max_demand": float(max(monthly_demand.values())) if monthly_demand else 0.0,
+                "min_demand": float(min(monthly_demand.values())) if monthly_demand else 0.0,
+            },
+        }
+        return summary
+
+    def get_product_context(self, product_id: str) -> Dict[str, Any]:
+        """Return the selected product's full history and previous-year context for forecasting."""
+
+        product = self.get_product(product_id)
+        if product is None:
+            raise ValueError(f"Product '{product_id}' does not exist.")
+
+        history = self.get_product_history(product_id)
+        previous_year = self.get_previous_fiscal_year_summary(product_id)
+
+        return {
+            "product_id": product["product_id"],
+            "product_name": product["product_name"],
+            "category": product.get("category"),
+            "current_stock": float(product.get("current_stock", 0.0)),
+            "perishable": bool(product.get("perishable", 0)),
+            "perishable_lifetime_days": float(product.get("perishable_lifetime_days", 1.0) or 1.0),
+            "history": history,
+            "previous_fiscal_year": previous_year,
+        }
+
+    def get_available_food_items(self) -> List[Dict[str, Any]]:
+        """Public convenience method returning the available perishable food products."""
+
+        return self.get_product_catalog(include_perishable_only=True)
 
     def save_forecast(
         self,
