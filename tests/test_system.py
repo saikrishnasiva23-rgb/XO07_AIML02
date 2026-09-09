@@ -6,6 +6,7 @@ import pytest
 
 from src.api_client import EvaluationRunner, MockEvaluationServer
 from src.database import RetailDatabase
+from src.spark_loader import ElectricityDataLoader
 from src.system import AdaptiveRetailSystem
 
 
@@ -20,6 +21,18 @@ def _stable_history(length: int = 50, center: float = 100.0):
 
 def _gradual_shift_history(length: int = 25, start: float = 100.0):
     return [start + idx * 1.5 for idx in range(length)]
+
+
+def test_empty_electricity_dataset_raises_clear_error(tmp_path):
+    csv_path = tmp_path / "electricity.csv"
+    csv_path.write_text("")
+
+    loader = ElectricityDataLoader(data_path=csv_path)
+    try:
+        with pytest.raises(ValueError, match="empty|missing required columns"):
+            loader.load_dataset()
+    finally:
+        loader.close()
 
 
 def test_initialization_sets_up_system_and_history():

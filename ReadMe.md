@@ -1,250 +1,87 @@
-**ADAPTIVE RETAIL DEMAND FORECASTING UNDER CHANGING CONDITIONS**
+# Adaptive Electricity Forecasting
 
+This project keeps the existing adaptive forecasting architecture but reorients it around the electricity challenge.
 
+## Problem statement
 
-*1. PROJECT OVERVIEW*
+The forecasting target is the electricity `target` column in `data/electricity.csv`. The system must predict future target values from historical timestamp and feature information while preserving a strict no-lookahead rule: the target is hidden during prediction and only revealed after the prediction is made.
 
+## Dataset
 
+The dataset is expected to live at `data/electricity.csv` and must contain the following columns:
 
-This project develops an adaptive time-series forecasting system for retail demand prediction.
+- `timestamp`
+- `feature_1`
+- `feature_2`
+- `feature_3`
+- `feature_4`
+- `feature_5`
+- `feature_6`
+- `target`
 
+The project treats all `feature_*` columns as numeric inputs and does not assign arbitrary business meaning to them beyond that.
 
+## PySpark pipeline
 
-The system predicts future product demand using historical sales data and continuously monitors whether the learned patterns are still reliable.
+The implementation uses PySpark for the ingestion and validation pipeline. A SparkSession is created through the `ElectricityDataLoader` in `src/spark_loader.py`, which:
 
+- loads the CSV with a header,
+- validates the expected schema,
+- parses the date column using `dd-MM-yyyy`,
+- converts numeric features and target to numeric types,
+- detects null and invalid values,
+- sorts the observations chronologically,
+- adds temporal features such as year, month, day, day_of_week, and week_of_year,
+- rejects empty or malformed data before model fitting.
 
+## Forecasting approach
 
-When a meaningful and persistent change in customer demand is detected, the system adapts its forecasting strategy instead of continuing to use an outdated pattern.
+The adaptive forecasting loop reuses the existing ensemble/monitor/adaptation structure for a numeric target sequence. The forecasting engine is kept generic and works with sequential target values while the feature engineering layer supplies the date and feature context.
 
+## No-data-leakage strategy
 
+Predictions are generated from the current features and historical values only. The target is never used as a feature during prediction. The actual target is only consumed after prediction to compute an error, update monitoring, and trigger adaptation if the drift signal shows persistent behavior.
 
-The main goal is to make the forecasting system responsive to changing real-world conditions while avoiding unnecessary adaptation to temporary fluctuations or isolated anomalies.
+## Adaptive loop
 
+The project follows the required cycle:
 
+1. current features are supplied,
+2. target remains hidden,
+3. prediction is generated,
+4. actual target is revealed,
+5. prediction error is computed,
+6. drift is monitored,
+7. persistent change triggers adaptation,
+8. the system continues forecasting with the updated model state.
 
-*2. PROBLEM STATEMENT*
+## Evaluation and SC1/SC2 support
 
+The existing evaluation client and mock session logic remain in place and continue to support the sequential hidden-target workflow without automatically starting the real external evaluation server.
 
+## Running the project
 
-Traditional forecasting models often assume that the patterns in historical data remain stable.
+Install dependencies:
 
+```bash
+pip install -r requirements.txt
+```
 
+Run tests:
 
-However, retail demand can change because of factors such as:
+```bash
+python -m pytest -q
+```
 
+Run the dashboard:
 
+```bash
+streamlit run dashboard\dashboard.py
+```
 
-Seasonal changes
+## Notes
 
-Festivals
-
-Promotional campaigns
-
-Price changes
-
-Customer behavior
-
-Market trends
-
-Unexpected events
-
-
-
-A forecasting model that does not adapt to these changes can produce inaccurate predictions.
-
-
-
-Therefore, this project focuses on building a forecasting system that can continuously monitor its performance, detect meaningful changes, and adapt when necessary.
-
-
-
-*3. OBJECTIVE*
-
-
-
-The main objectives of the project are:
-
-
-
-1\. Predict future retail product demand.
-
-
-
-2\. Continuously monitor forecasting performance.
-
-
-
-3\. Detect meaningful changes in demand patterns.
-
-
-
-4\. Distinguish persistent changes from temporary abnormalities.
-
-
-
-5\. Adapt the forecasting model when a genuine change is detected.
-
-
-
-6\. Avoid using future information while making predictions.
-
-
-
-7\. Provide a real-time dashboard to visualize forecasting and adaptation.
-
-
-
-8\. PROPOSED SYSTEM
-
-
-
-The system follows a continuous prediction and adaptation cycle.
-
-
-
-Historical Data
-
-↓
-
-Demand Forecasting
-
-↓
-
-Future Demand Prediction
-
-↓
-
-Actual Demand Arrives
-
-↓
-
-Forecast Error Calculation
-
-↓
-
-Change Monitoring
-
-↓
-
-Change Detected?
-
-↓
-
-Adapt Forecasting Strategy
-
-↓
-
-Generate Next Prediction
-
-
-
-*5. RETAIL DEMAND FORECASTING*
-
-
-
-The system is applied to retail demand forecasting.
-
-
-
-The predicted value represents the number of units of a product expected to be sold or required during the next time period.
-
-
-
-For example:
-
-
-
-Day 1 → 100 units
-
-Day 2 → 105 units
-
-Day 3 → 110 units
-
-Day 4 → 108 units
-
-Day 5 → 115 units
-
-
-
-The system uses the available historical information to forecast the demand for the next day.
-
-
-
-*6. CHANGE DETECTION*
-
-
-
-The system continuously monitors the difference between predicted demand and actual demand.
-
-
-
-A small error may simply represent normal variation.
-
-
-
-However, if forecasting errors remain unusually high for several observations, it may indicate that the underlying demand pattern has changed.
-
-
-
-The system therefore uses change detection techniques to identify meaningful and persistent changes while reducing false alarms caused by short-lived abnormalities.
-
-
-
-*7. MODEL ADAPTATION*
-
-
-
-When a genuine change is confirmed, the system adapts its forecasting strategy.
-
-
-
-Possible adaptation mechanisms include:
-
-
-
-Updating model weights
-
-Retraining using recent data
-
-Refreshing the forecasting model
-
-Switching between forecasting strategies
-
-
-
-The purpose of adaptation is to allow the forecasting system to learn from the new demand pattern instead of continuing to rely only on older behavior.
-
-
-
-*8. EXAMPLE USE CASE*
-
-
-
-Consider a retail store selling a particular product.
-
-
-
-Under normal conditions, daily demand may be around:
-
-
-
-100 → 105 → 110 → 108 → 115
-
-
-
-The forecasting system learns this pattern.
-
-
-
-Later, a festival promotion causes demand to increase:
-
-
-
-150 → 180 → 210 → 220 → 240
-
-
-
-The forecasting errors become consistently larger.
+The workspace currently contains an empty `data/electricity.csv` file. The project code validates the dataset and will not fabricate or invent rows. The loader is built to process the actual dataset once it is populated with the expected electricity fields.
 
 
 

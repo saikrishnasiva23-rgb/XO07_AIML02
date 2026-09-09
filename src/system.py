@@ -1,6 +1,6 @@
 """
-Adaptive Retail Demand Forecasting System
------------------------------------------
+Adaptive Electricity Forecasting System
+-------------------------------------
 
 Connects:
 
